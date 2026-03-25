@@ -27,6 +27,10 @@ class ColumnStore:
             column_name = self.header[i]
             self.columns[column_name].append(value)
 
+    def print_row(self, index):
+        row = [self.columns[column_name][index] for column_name in self.header]
+        print(row)
+
 
 def main():
 
@@ -46,6 +50,11 @@ def main():
         # Insert rows into the column store
         for row in reader:
             column_store.insert_row(row)
+        
+    print("Column Store created successfully!")
+
+    column_store.print_row(1) # Print the first entry to verify
+    column_store.print_row(259236) # Print the last entry to verify
 
     # Querying, Find the minimun price per square metre of matched flats
     # Input: U2340985K (Jonathan's Matric No.)
