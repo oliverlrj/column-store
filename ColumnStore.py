@@ -6,7 +6,6 @@
 # Simple SQL-Implementation is NOT column-oriented
 
 
-# Packages
 import csv
 
 class ColumnStore:
@@ -33,8 +32,6 @@ class ColumnStore:
 
 
 def main():
-
-    
     
     # CSV file -> Column Store
     column_store = ColumnStore()
@@ -82,9 +79,6 @@ def main():
     # List of towns Depends on ALL digits of Matric No. (Refer to file)
     #
     # square metres y is the range, 80 <= y <= 150
-
-
-
 
 
 if __name__ == "__main__":
