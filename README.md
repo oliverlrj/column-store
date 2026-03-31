@@ -137,7 +137,7 @@ Read flow and optimization:
 
 ---
 
-### `storage/store.py` - The Orchestrator
+### `storage/store.py` — The Orchestrator
 The bridge between the Storage layer and the Query layer. It manages the entire lifecycle of the database.
 * **Build Phase:** Reads the raw `ResalePricesSingapore.csv`, parses the dates, delegates data to the 12 `ColumnWriters`, and saves the Dictionaries and Inverted Index to disk.
 * **Query Phase:** Loads the Dictionaries and Indexes back into memory, initializes the `ColumnReaders`, and exposes a clean `get_value(column_name, row_index)` API for the execution engine to use.
