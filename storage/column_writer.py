@@ -10,6 +10,7 @@ import os
 from storage.page import Page
 from storage.schema import ColumnDef, DType
 from storage.dictionary import Dictionary
+from query.zone_map import ZoneMap 
 
 
 class ColumnWriter:
@@ -28,6 +29,7 @@ class ColumnWriter:
         self.col_def    = col_def
         self.dictionary = dictionary
         self.page_count = 0
+        self.zone_map = ZoneMap(col_def.name)
 
         os.makedirs(data_dir, exist_ok=True)
         self._file     = open(col_def.bin_path(data_dir), "wb")
@@ -58,6 +60,21 @@ class ColumnWriter:
 
     def _flush_page(self) -> None:
         """Serialize the current page to exactly 4096 bytes and write to disk."""
+
+        # Calculate and store Zone Map statistics before flushing
+        if self._cur_page.records:
+            if self.dictionary is None:
+                # Numeric column (like floor_area): Store min and max
+                min_val = min(self._cur_page.records)
+                max_val = max(self._cur_page.records)
+                self.zone_map.add_area_stats(min_val, max_val)
+            else:
+                # Dictionary column (like town): Calculate and store bitmask
+                bitmask = 0
+                for val in self._cur_page.records:
+                    bitmask |= (1 << val)
+                self.zone_map.add_town_bitmask(bitmask)
+                
         self._file.write(self._cur_page.serialize())
         self.page_count += 1
         self._cur_page = Page(page_id=self.page_count, dtype=self.col_def.dtype)

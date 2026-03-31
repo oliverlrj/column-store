@@ -123,11 +123,54 @@ Block 1:  [8-byte header][4088 town IDs packed as INT8]
 Block 46: [8-byte header][partial block, zero-padded to 4096 bytes]
 ```
 
+### `storage/column_reader.py` — Read path
+
+The counterpart to the writer. It fetches specific rows from the binary `.bin` files without loading the entire file into memory.
+
+Read flow and optimization:
+* **Byte-Offset Math:** Calculates exactly which 4096-byte block a requested row lives in (`row_index // capacity`).
+* **Disk Buffering:** Keeps the most recently read 4096-byte block in memory. If the query asks for row 10,000 and then row 10,001, the reader grabs the second value directly from RAM instead of hitting the hard drive twice.
+* **Deserialization:** Locates the exact byte offset within the buffered block (`8-byte header + offset`), slices the raw bytes, and uses `struct.unpack` to convert them back to native Python types based on `DType`.
+
+
+### `storage/store.py`
+#### The Orchestrator
+The bridge between the Storage layer and the Query layer. It manages the entire lifecycle of the database.
+* **Build Phase:** Reads the raw `ResalePricesSingapore.csv`, parses the dates, delegates data to the 12 `ColumnWriters`, and saves the Dictionaries and Inverted Index to disk.
+* **Query Phase:** Loads the Dictionaries and Indexes back into memory, initializes the `ColumnReaders`, and exposes a clean `get_value(column_name, row_index)` API for the execution engine to use.
+
+
+---
+## Query Layer (`query/`)
+
+### `zone_map.py` — Data Skipping Index
+
+A vital optimization to prevent the `ColumnReader` from doing unnecessary disk I/O. The Zone Map acts as a metadata cheat sheet for every 4096-byte block on disk.
+
+* **Numeric Columns (e.g., floor_area):** Stores the `(min, max)` values of the block. If a query looks for flats >= 120sqm, and a block's max is 90sqm, the entire block is skipped.
+* **Dictionary Columns (e.g., town):** Stores a bitmask representing which dictionary IDs are present in the block. Uses lightning-fast bitwise `&` operations to check if target towns exist in the block before reading it.
+
+
+### `index.py` — Inverted Month Index
+
+A high-level index that maps a specific Year and Month (e.g., `2015-08`) to a set of specific block numbers. 
+* During the query phase, the engine asks the index for the blocks corresponding to the target 8-month window. 
+* Any block not returned by the index is instantly bypassed, allowing the engine to skip hundreds of thousands of irrelevant rows without executing a single disk read.
+
+
+### `query.py` — The Execution Engine
+
+The core logic that solves the target analysis problem using a "Scorecard Matrix" approach.
+
+* **Single-Pass Architecture:** Instead of querying the database multiple times for different `(x, y)` combinations, the engine scans the valid blocks exactly once.
+* **Cascading Logic:** As a valid flat is found, its `Price Per Square Meter` is calculated and automatically cascaded down to update the minimum price for every valid `y` (area) parameter it satisfies.
+* **Output:** Formats the final results and generates the target `ScanResult_<MatricNum>.csv` file.
+
+---
 ## What's Next
 
-- `storage/column_reader.py` — read values back from disk by row position, with a 1-block buffer to avoid redundant disk reads
-- `storage/store.py` — orchestrator: one writer/reader per column, loads CSV, exposes `get_value(col, row)` API
-- `query/zone_map.py` — per-block metadata (bitmask for towns, min/max for area) to skip irrelevant blocks
+
+- `storage/store.py` — orchestrator: one writer/reader per column, loads CSV, exposes. `get_value(col, row)` API
 - `query/index.py` — month inverted index mapping month values to block numbers
 - `query/query.py` — filtering pipeline and aggregation (min price/sqm, etc.)
 - `main.py` — CLI entry point, matric number parsing, (x, y) loop, CSV output
