@@ -16,94 +16,77 @@ def run_query():
     
     # We must pass the exact number of rows your database built.
     # Replace 259236 with your actual row count if it differs!
-    TOTAL_ROWS = 259236 
+    TOTAL_ROWS = 259237 
     store.open_for_queries(TOTAL_ROWS)
 
     # The Scorecard: A dictionary to hold the best flat for each (x, y) pair
     # Key: (x, y) tuple -> Value: Dictionary of flat details
     scorecard = {}
 
-    # --- Using the inverted index ---
-    print("Consulting the Inverted Index...")
-    valid_blocks = set()
-    # We want data from August (Month 1) up to March of next year (Month 8)
-    for i in range(8):
-        # Calculate wrapping months (e.g., Month 13 becomes Jan of next year)
-        target_month = COMMENCING_MONTH + i
-        target_year = TARGET_YEAR
-        if target_month > 12:
-            target_month -= 12
-            target_year += 1
-            
-        # Ask the index which blocks hold these months
-        blocks = store.month_index.get_blocks(target_year, target_month)
-        valid_blocks.update(blocks)
+    # --- Using the inverted index for each x ---
+    print("Consulting the Inverted Index for each x...")
+    
+    for x in range(1, 9):  # x from 1 to 8
+        valid_blocks = set()
+        # For this x, we scan from August 2015 up to the x-th month
+        for i in range(x):
+            target_month = COMMENCING_MONTH + i
+            target_year = TARGET_YEAR
+            if target_month > 12:
+                target_month -= 12
+                target_year += 1
+                
+            blocks = store.month_index.get_blocks(target_year, target_month)
+            valid_blocks.update(blocks)
         
-    print(f"Index optimization: Only scanning {len(valid_blocks)} blocks instead of reading the whole file!")
-    # -----------------------------------
-
-    for i in range(TOTAL_ROWS):
-        # To skip data blocks that don't contain our target months, we can check the block number first before reading any columns.
-        # If this row belongs to a block that isn't in our valid list, skip it instantly!
-        if (i // 4088) not in valid_blocks:
-            continue
-            
-        # 1. Filter by Year (Fastest check first)
-        year = store.get_value('year', i)
-
-    print("Scanning 259,000+ rows... (This will take a few seconds)")
-
-    # The "One-Pass" Scan: We read each row once and apply all filters in sequence. If a row fails any filter, we skip to the next one immediately.
-    for i in range(TOTAL_ROWS):
+        print(f"x={x}: Scanning {len(valid_blocks)} blocks...")
         
-        # 1. Filter by Year (Fastest check first)
-        year = store.get_value('year', i)
-        if year != TARGET_YEAR:
-            continue
+        # Scan rows in these blocks
+        for i in range(TOTAL_ROWS):
+            if (i // 4088) not in valid_blocks:
+                continue
+                
+            # 1. Filter by Year and Month for this x
+            year = store.get_value('year', i)
+            month_num = store.get_value('month_num', i)
             
-        # 2. Filter by Town
-        town = store.get_value('town', i)
-        if town not in TARGET_TOWNS:
-            continue
+            # Check if this row's month is within the period for this x
+            months_passed = ((year - TARGET_YEAR) * 12) + (month_num - COMMENCING_MONTH)
+            if months_passed < 0 or months_passed >= x:
+                continue
+                
+            # 2. Filter by Town
+            town = store.get_value('town', i)
+            if town not in TARGET_TOWNS:
+                continue
+                
+            # 3. Calculate Price per Square Meter
+            area = store.get_value('floor_area', i)
+            price = store.get_value('resale_price', i)
+            price_per_sqm = price / area
             
-        # 3. Filter by Month to calculate 'x' (Timeframe)
-        month_num = store.get_value('month_num', i)
-        months_passed = month_num - COMMENCING_MONTH
-        if months_passed < 0:
-            continue # Sale happened before August
-            
-        x = months_passed + 1 # e.g., August = Month 1, Sept = Month 2
-        if x < 1 or x > 8:
-            continue # Sale is outside our 8-month window
-            
-        # 4. Calculate Price per Square Meter
-        area = store.get_value('floor_area', i)
-        price = store.get_value('resale_price', i)
-        price_per_sqm = price / area
-        
-        # Must be at most 4725
-        if price_per_sqm > MAX_PRICE_PER_SQM:
-            continue
+            # Must be at most 4725
+            if price_per_sqm > MAX_PRICE_PER_SQM:
+                continue
 
-        # 5. Update the Scorecard for 'y' (Area Requirement)
-        # If a flat is 95 sqm, it satisfies the requirement for y=80, 81, ..., 95.
-        max_y = min(150, int(math.floor(area)))
-        
-        for y in range(80, max_y + 1):
-            key = (x, y)
+            # 4. Update the Scorecard for 'y' (Area Requirement)
+            max_y = min(150, int(math.floor(area)))
             
-            # If this (x,y) slot is empty OR we found a cheaper flat, save it!
-            if key not in scorecard or price_per_sqm < scorecard[key]['price_per_sqm']:
-                scorecard[key] = {
-                    'price_per_sqm': price_per_sqm,
-                    'year': year,
-                    'month': month_num,
-                    'town': town,
-                    'block': store.get_value('block', i),
-                    'floor_area': area,
-                    'flat_model': store.get_value('flat_model', i),
-                    'lease_date': store.get_value('lease_date', i)
-                }
+            # Valid y requirements are 80 to 150
+            for y in range(80, max_y + 1):
+                key = (x, y)
+                
+                if key not in scorecard or price_per_sqm < scorecard[key]['price_per_sqm']:
+                    scorecard[key] = {
+                        'price_per_sqm': price_per_sqm,
+                        'year': year,
+                        'month': month_num,
+                        'town': town,
+                        'block': store.get_value('block', i),
+                        'floor_area': area,
+                        'flat_model': store.get_value('flat_model', i),
+                        'lease_date': store.get_value('lease_date', i),
+                    }
 
     store.close()
     
