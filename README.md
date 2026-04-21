@@ -6,15 +6,15 @@ A disk-based column-oriented storage engine for HDB resale flat data (SC4023 pro
 
 ```
 column-store/
-  storage/          core storage engine
-  query/            filtering and aggregation (in progress)
-  data/             generated binary column files (git-ignored)
-  constants.py      known value lists (towns, flat types, etc.)
-  main.py           entry point
-  ColumnStore.py    friend's original in-memory reference implementation
+  storage/          core storage engine (schema, pages, dicts, writers/readers, store)
+  query/            zone maps, month index, execution engine
+  data/             binary column files, dictionaries, month index JSON (committed for reproducibility)
+  main.py           program entry (documented in Entry point section)
 ```
 
 ## Storage Layer (`storage/`)
+
+Bottom-up layout: **`schema.py`** (types and column list) → **`page.py`** (4096-byte on-disk page) → **`dictionary.py`** (string → id) → **`column_writer.py`** / **`column_reader.py`** (append and random access per column) → **`store.py`** (orchestrates load, dictionaries, and `get_value` for queries).
 
 ### `schema.py` — Column definitions
 
@@ -115,70 +115,66 @@ raw CSV string
         start new Page
 ```
 
-Result on disk — e.g. `col_town.bin` with ~190k rows at 1 byte/value ≈ 47 blocks:
+Result on disk — e.g. `col_town.bin` with ~259k rows at 1 byte/value ≈ 64 blocks:
 ```
 Block 0:  [8-byte header][4088 town IDs packed as INT8]
 Block 1:  [8-byte header][4088 town IDs packed as INT8]
 ...
-Block 46: [8-byte header][partial block, zero-padded to 4096 bytes]
+Block 63: [8-byte header][partial block, zero-padded to 4096 bytes]
 ```
 
 ---
 
-### `storage/column_reader.py` — Read path
+### `column_reader.py` — Read path
 
 The counterpart to the writer. It fetches specific rows from the binary `.bin` files without loading the entire file into memory.
 
-Read flow and optimization:
-* **Byte-Offset Math:** Calculates exactly which 4096-byte block a requested row lives in (`row_index // capacity`).
-* **Disk Buffering:** Keeps the most recently read 4096-byte block in memory. If the query asks for row 10,000 and then row 10,001, the reader grabs the second value directly from RAM instead of hitting the hard drive twice.
-* **Deserialization:** Locates the exact byte offset within the buffered block (`8-byte header + offset`), slices the raw bytes, and uses `struct.unpack` to convert them back to native Python types based on `DType`.
+Read path:
+* **Block index:** `row_index // capacity`, where `capacity` is `4088 // dtype` bytes (same idea as the writer’s page capacity).
+* **Single-block buffer:** Keeps the last-read 4096-byte page in memory so consecutive rows in the same block avoid extra disk reads.
+* **Decode:** Offset within the page (`8-byte header + index * dtype size`), then `struct.unpack` using `DType`’s format.
 
 
 ---
 
-### `storage/store.py` — The Orchestrator
-The bridge between the Storage layer and the Query layer. It manages the entire lifecycle of the database.
-* **Build Phase:** Reads the raw `ResalePricesSingapore.csv`, parses the dates, delegates data to the 12 `ColumnWriters`, and saves the Dictionaries and Inverted Index to disk.
-* **Query Phase:** Loads the Dictionaries and Indexes back into memory, initializes the `ColumnReaders`, and exposes a clean `get_value(column_name, row_index)` API for the execution engine to use.
+### `store.py` — Orchestrator
+
+Bridge between storage and query: owns build from CSV and the open-for-query lifecycle.
+* **Build (`build_from_csv`):** Reads `ResalePricesSingapore.csv`, splits the CSV `month` field into `year` / `month_num` to align with `COLUMNS`, streams each row through 12 `ColumnWriter`s, updates the on-disk month index (`MonthIndex`), and saves dictionaries JSON. (Run when you need to regenerate `data/`.)
+* **Query (`open_for_queries`):** Loads dictionaries and `MonthIndex`, opens one `ColumnReader` per column, exposes `get_value(column_name, row_index)` on the `ColumnStore` class.
 
 
 ---
 
 ## Query Layer (`query/`)
 
-### `zone_map.py` — Data Skipping Index
+### `zone_map.py` — Per-block statistics
 
-A vital optimization to prevent the `ColumnReader` from doing unnecessary disk I/O. The Zone Map acts as a metadata cheat sheet for every 4096-byte block on disk.
-
-* **Numeric Columns (e.g., floor_area):** Stores the `(min, max)` values of the block. If a query looks for flats >= 120sqm, and a block's max is 90sqm, the entire block is skipped.
-* **Dictionary Columns (e.g., town):** Stores a bitmask representing which dictionary IDs are present in the block. Uses lightning-fast bitwise `&` operations to check if target towns exist in the block before reading it.
+`ColumnWriter` updates a `ZoneMap` on each page flush: **numeric** columns record per-block `(min, max)`; **dictionary-encoded** columns record a bitmask of which dictionary IDs appear in the block. `should_scan_block(block_num, target_min_area, target_town_ids)` returns whether a block could still contain a matching row for those constraints.
 
 
 ---
 
-### `index.py` — Inverted Month Index
+### `index.py` — Month index (`MonthIndex`)
 
-A high-level index that maps a specific Year and Month (e.g., `2015-08`) to a set of specific block numbers. 
-* During the query phase, the engine asks the index for the blocks corresponding to the target 8-month window. 
-* Any block not returned by the index is instantly bypassed, allowing the engine to skip hundreds of thousands of irrelevant rows without executing a single disk read.
+Maps `(year, month)` to the set of block numbers that contain at least one row from that month (built during CSV ingest, loaded in `open_for_queries`).
 
+* For each `x`, `query.py` unions the blocks for the months in the rolling window and only considers rows whose block id `row_index // 4088` appears in that union (matching how blocks are tagged during `build_from_csv`).
+* Rows that pass this stage are filtered by `year`, `month_num`, town, and price limits as required by the assignment.
+
+
+---
+
+### `query.py` — Execution engine
+
+Implements the assignment logic: towns, price-per-m² cap, rolling windows from August 2015, and `(x, y)` pairs.
+
+* **Scanning:** For each `x` (1–8), it collects candidate blocks from the month index for the corresponding months, then scans those rows after filters (town, window, price/sqm).
+* **Scorecard:** Keeps the best (minimum) price per m² per `(x, y)` when a row qualifies; `y` runs over valid floor-area bands as required by the brief.
+* **Output:** Writes `ScanResult_<MatricNum>.csv` with the required columns and ordering, or `No result` when nothing qualifies.
 
 ---
 
-### `query.py` — The Execution Engine
+## Entry point (`main.py`)
 
-The core logic that solves the target analysis problem using a "Scorecard Matrix" approach.
-
-* **Single-Pass Architecture:** Instead of querying the database multiple times for different `(x, y)` combinations, the engine scans the valid blocks exactly once.
-* **Cascading Logic:** As a valid flat is found, its `Price Per Square Meter` is calculated and automatically cascaded down to update the minimum price for every valid `y` (area) parameter it satisfies.
-* **Output:** Formats the final results and generates the target `ScanResult_<MatricNum>.csv` file.
-
----
-## What's Next (Completed)
-- `storage/column_reader.py` — read values back from disk by row position, with a 1-block buffer to avoid redundant disk reads
-- `storage/store.py` — orchestrator: one writer/reader per column, loads CSV, exposes. `get_value(col, row)` API
-- `query/zone_map.py` — per-block metadata (bitmask for towns, min/max for area) to skip irrelevant blocks
-- `query/index.py` — month inverted index mapping month values to block numbers
-- `query/query.py` — filtering pipeline and aggregation (min price/sqm, etc.)
-- `main.py` — CLI entry point, matric number parsing, (x, y) loop, CSV output
+`main.py` calls `run_query()` from `query.query`, which opens the column store with `open_for_queries` and runs the scan and CSV export. To rebuild `data/` from `ResalePricesSingapore.csv`, use `ColumnStore.build_from_csv` (see `storage/store.py`).
